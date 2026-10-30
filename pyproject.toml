@@ -1,0 +1,23 @@
+[project]
+name = "false-anthropic"
+version = "0.1.0"
+description = "Anthropic SDK compatible interface for the Google GenAI SDK, to do the Anthropic certification exercises with a free tier Gemini API key"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    # `parse_response` is imported from a private module of the SDK, so stay on the tested major version
+    "anthropic>=2.3.0,<3",
+    "google-genai>=2.34.0",
+    "pydantic>=2",
+]
+
+[dependency-groups]
+dev = [
+    "python-dotenv>=1.2.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.4,<0.11.0"]
+build-backend = "uv_build"
