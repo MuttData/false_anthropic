@@ -105,6 +105,67 @@ _THOUGHT_SIGNATURE_FIELD = "gemini_thought_signature"
 _DUMMY_THOUGHT_SIGNATURE = b"skip_thought_signature_validator"
 
 
+# Gemini rejects requests ending with a model turn, so a prefill is followed by this user turn
+_PREFILL_CONTINUE_PROMPT = (
+    "Continue your previous response exactly from where it ends. Do not repeat any of it, output only the continuation."
+)
+
+
+class _PrefillContinuation:
+    """Emulates an Anthropic prefill (a request ending with an assistant message), which Gemini rejects.
+
+    The model is asked to continue the prefill text. If it repeats the prefill anyway, this class removes that echo,
+    so only the continuation is returned, like Anthropic does. Stop sequences are applied here instead of by Gemini,
+    otherwise one that matches an echoed prefill (e.g. prefill "```json" and stop sequence "```") would end the
+    response before it starts. It also lets us report the `stop_sequence` that was hit.
+    """
+
+    def __init__(self, prefill: str, stop_sequences: list[str] | None):
+        self.prefill = prefill
+        self.stop_sequences = [s for s in stop_sequences or [] if s]
+        self.stop_sequence: str | None = None  # the stop sequence that was hit, if any
+        self._buffer = ""
+        self._prefill_checked = False
+
+    def feed(self, text: str) -> str:
+        """Takes the next piece of model output and returns the part of it that is ready to be emitted."""
+        if self.stop_sequence is not None:
+            return ""
+        self._buffer += text
+
+        if not self._prefill_checked:
+            stripped = self._buffer.lstrip()
+            if len(stripped) < len(self.prefill) and self.prefill.startswith(stripped):
+                return ""  # can't tell yet if the model is echoing the prefill
+            if stripped.startswith(self.prefill):
+                self._buffer = stripped[len(self.prefill):]
+            # otherwise the model continued straight away, keep its output as is
+            self._prefill_checked = True
+
+        hits = [(self._buffer.find(s), s) for s in self.stop_sequences if s in self._buffer]
+        if hits:
+            position, self.stop_sequence = min(hits)
+            text, self._buffer = self._buffer[:position], ""
+            return text
+
+        # hold back the tail, it could be the start of a stop sequence split across chunks
+        hold_back = max((len(s) - 1 for s in self.stop_sequences), default=0)
+        cut = len(self._buffer) - hold_back
+        if cut <= 0:
+            return ""
+        text, self._buffer = self._buffer[:cut], self._buffer[cut:]
+        return text
+
+    def flush(self) -> str:
+        """Returns the output held back once the model has finished."""
+        if not self._prefill_checked:
+            # the whole output is (a part of) the echoed prefill
+            self._prefill_checked = True
+            self._buffer = ""
+        text, self._buffer = self._buffer, ""
+        return text
+
+
 class FalseStream:
     """Stand-in for `anthropic.Stream`: iterates the raw events returned by `create(..., stream=True)`."""
 
@@ -180,6 +241,12 @@ class FalseAnthropicMessages:
         output_config: AnthropicOutputConfig | None = None,
         stream: bool = False,
     ) -> anthropic.types.Message | FalseStream:
+        continuation = None
+        if messages and messages[-1]["role"] == "assistant":
+            continuation = _PrefillContinuation(self._prefill_text(messages[-1]), stop_sequences)
+            messages = [*messages, {"role": "user", "content": _PREFILL_CONTINUE_PROMPT}]
+            stop_sequences = None  # applied by the continuation
+
         # Gemini function responses are matched by name, Anthropic tool results only carry the id
         tool_names = {
             block["id"]: block["name"]
@@ -204,14 +271,20 @@ class FalseAnthropicMessages:
                 contents=genai_messages,
                 config=genai_config
             )
-            return FalseStream(self._stream_events(chunks, model=model))
+            return FalseStream(self._stream_events(chunks, model=model, continuation=continuation))
 
         response = self.client.models.generate_content(
             model=model,
             contents=genai_messages,
             config=genai_config
         )
-        return self._from_genai_to_anthropic(response, model=model)
+        return self._from_genai_to_anthropic(response, model=model, continuation=continuation)
+
+    def _prefill_text(self, message: AnthropicMessage) -> str:
+        blocks = self._blocks_from_content(message["content"])
+        if any(block["type"] != "text" for block in blocks):
+            raise ValueError("A final assistant message (prefill) can only contain text")
+        return "".join(block["text"] for block in blocks)
 
     def _from_anthropic_to_genai(self, message: AnthropicMessage, tool_names: dict[str, str]) -> types.Content:
         return types.Content(
@@ -261,7 +334,11 @@ class FalseAnthropicMessages:
         return "\n".join(texts)
 
     def _from_genai_to_anthropic(
-        self, response: types.GenerateContentResponse, *, model: str
+        self,
+        response: types.GenerateContentResponse,
+        *,
+        model: str,
+        continuation: _PrefillContinuation | None = None,
     ) -> anthropic.types.Message:
         candidate = response.candidates[0] if response.candidates else None
         parts = candidate.content.parts if candidate and candidate.content and candidate.content.parts else []
@@ -278,12 +355,24 @@ class FalseAnthropicMessages:
                 else:
                     content.append(anthropic.types.TextBlock(type="text", text=part.text))
 
+        if continuation is not None:
+            continued = []
+            for block in content:
+                if continuation.stop_sequence is not None:
+                    break  # the output after a stop sequence is dropped
+                if block.type == "text":
+                    block.text = continuation.feed(block.text) + continuation.flush()
+                continued.append(block)
+            content = continued
+
         has_tool_use = any(block.type == "tool_use" for block in content)
+        stop_sequence = continuation.stop_sequence if continuation else None
         return self._message(
             response,
             model=model,
             content=content,
-            stop_reason=self._stop_reason(candidate, has_tool_use),
+            stop_reason="stop_sequence" if stop_sequence else self._stop_reason(candidate, has_tool_use),
+            stop_sequence=stop_sequence,
             usage=self._usage(response.usage_metadata),
         )
 
@@ -295,6 +384,7 @@ class FalseAnthropicMessages:
         content: list[anthropic.types.ContentBlock],
         stop_reason: anthropic.types.StopReason | None,
         usage: anthropic.types.Usage,
+        stop_sequence: str | None = None,
     ) -> anthropic.types.Message:
         return anthropic.types.Message(
             id=f"msg_{response.response_id or uuid.uuid4().hex}",
@@ -303,12 +393,17 @@ class FalseAnthropicMessages:
             model=response.model_version or model,
             content=content,
             stop_reason=stop_reason,
-            stop_sequence=None,  # Gemini does not report which stop sequence was hit
+            # Gemini does not report which stop sequence was hit, only a prefill continuation knows it
+            stop_sequence=stop_sequence,
             usage=usage,
         )
 
     def _stream_events(
-        self, chunks: Iterator[types.GenerateContentResponse], *, model: str
+        self,
+        chunks: Iterator[types.GenerateContentResponse],
+        *,
+        model: str,
+        continuation: _PrefillContinuation | None = None,
     ) -> Iterator[anthropic.types.RawMessageStreamEvent]:
         """Translates Gemini stream chunks into the Anthropic raw event sequence:
         message_start, (content_block_start, content_block_delta*, content_block_stop)*, message_delta, message_stop
@@ -317,6 +412,26 @@ class FalseAnthropicMessages:
         index = -1  # index of the current content block
         open_block_type = None  # type of the block that has not been stopped yet, if any
         has_tool_use = False
+
+        def text_events(text: str) -> Iterator[anthropic.types.RawMessageStreamEvent]:
+            nonlocal index, open_block_type
+            if not text:
+                return
+            if open_block_type != "text":
+                if open_block_type is not None:
+                    yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
+                index += 1
+                open_block_type = "text"
+                yield anthropic.types.RawContentBlockStartEvent(
+                    type="content_block_start",
+                    index=index,
+                    content_block=anthropic.types.TextBlock(type="text", text=""),
+                )
+            yield anthropic.types.RawContentBlockDeltaEvent(
+                type="content_block_delta",
+                index=index,
+                delta=anthropic.types.TextDelta(type="text_delta", text=text),
+            )
 
         for chunk in chunks:
             if last_chunk is None:
@@ -353,33 +468,29 @@ class FalseAnthropicMessages:
                     yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
                     open_block_type = None
                 elif part.text and not part.thought:
-                    if open_block_type != "text":
-                        if open_block_type is not None:
-                            yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
-                        index += 1
-                        open_block_type = "text"
-                        yield anthropic.types.RawContentBlockStartEvent(
-                            type="content_block_start",
-                            index=index,
-                            content_block=anthropic.types.TextBlock(type="text", text=""),
-                        )
-                    yield anthropic.types.RawContentBlockDeltaEvent(
-                        type="content_block_delta",
-                        index=index,
-                        delta=anthropic.types.TextDelta(type="text_delta", text=part.text),
-                    )
+                    yield from text_events(continuation.feed(part.text) if continuation else part.text)
+
+            if continuation is not None and continuation.stop_sequence is not None:
+                chunks.close()  # the output after a stop sequence is dropped, no need to wait for it
+                break
 
         if last_chunk is None:
             raise RuntimeError("Gemini returned an empty stream")
+        if continuation is not None:
+            yield from text_events(continuation.flush())
         if open_block_type is not None:
             yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
 
         # the last chunk carries the finish reason and the cumulative token usage
         candidate = last_chunk.candidates[0] if last_chunk.candidates else None
         usage = self._usage(last_chunk.usage_metadata)
+        stop_sequence = continuation.stop_sequence if continuation else None
         yield anthropic.types.RawMessageDeltaEvent(
             type="message_delta",
-            delta=Delta(stop_reason=self._stop_reason(candidate, has_tool_use), stop_sequence=None),
+            delta=Delta(
+                stop_reason="stop_sequence" if stop_sequence else self._stop_reason(candidate, has_tool_use),
+                stop_sequence=stop_sequence,
+            ),
             usage=anthropic.types.MessageDeltaUsage(
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,

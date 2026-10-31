@@ -60,6 +60,7 @@ uv run examples/tool_use.py
 | --- | --- |
 | `messages.create` | `model`, `max_tokens`, `messages`, `system`, `temperature`, `stop_sequences` |
 | Multi-turn chats | `user` / `assistant` roles, string or text block content, `response.content` can be appended back to the history |
+| Prefill | ending `messages` with an assistant message makes the model continue from it (emulated, see below) |
 | Tool use | `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`), `tool_use` / `tool_result` blocks, parallel tool calls, `is_error` |
 | Streaming | `create(..., stream=True)` raw events and the `messages.stream()` helper (`text_stream`, `get_final_message()`, ...) |
 | Structured outputs | `output_config={"format": {"type": "json_schema", ...}}`, `messages.parse(output_format=Model)` and `messages.stream(output_format=Model)` |
@@ -69,7 +70,8 @@ Responses are real `anthropic.types.Message` objects, with `stop_reason` and `us
 
 ## Differences and limitations
 
-- `stop_reason` is never `"stop_sequence"` and `stop_sequence` is always `None`: Gemini does not report when a stop sequence was hit (the output is still cut).
+- Gemini rejects requests ending with an assistant message, so prefill is emulated: a user turn asking the model to continue is added, any repeated prefill text is stripped from the output, and stop sequences are applied by the library (so `stop_reason="stop_sequence"` and `stop_sequence` are reported). It is reliable for typical cases like prefilling ` ```json ` with stop sequence ` ``` `, but it is the model following an instruction, not a true continuation.
+- Without a prefill, `stop_reason` is never `"stop_sequence"` and `stop_sequence` is always `None`: Gemini does not report when a stop sequence was hit (the output is still cut).
 - Gemini streams in bigger chunks than Claude, and tool inputs arrive whole in a single `input_json` delta.
 - Structured output schemas are sent to Gemini as they are, so constraints like `minimum` / `maximum` are enforced by the model.
 - `output_config["effort"]` and `tool_choice["disable_parallel_tool_use"]` are ignored.
