@@ -64,6 +64,7 @@ uv run examples/tool_use.py
 | Tool use | `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`), `tool_use` / `tool_result` blocks, parallel tool calls, `is_error` |
 | Streaming | `create(..., stream=True)` raw events and the `messages.stream()` helper (`text_stream`, `get_final_message()`, ...) |
 | Structured outputs | `output_config={"format": {"type": "json_schema", ...}}`, `messages.parse(output_format=Model)` and `messages.stream(output_format=Model)` |
+| Beta API | `client.beta.messages.create` / `stream` / `parse` with `betas=[...]`; the betas are accepted and ignored (see below) |
 | MCP | client-side MCP (listing an MCP server's tools and passing them as `tools`), since it is regular tool use |
 
 Responses are real `anthropic.types.Message` objects, with `stop_reason` and `usage` mapped from the Gemini response.
@@ -75,5 +76,6 @@ Responses are real `anthropic.types.Message` objects, with `stop_reason` and `us
 - Gemini streams in bigger chunks than Claude, and tool inputs arrive whole in a single `input_json` delta.
 - Structured output schemas are sent to Gemini as they are, so constraints like `minimum` / `maximum` are enforced by the model.
 - `output_config["effort"]` and `tool_choice["disable_parallel_tool_use"]` are ignored.
+- `betas` are ignored and `client.beta.messages` returns the regular (non `Beta*`) types, which have the same fields. `fine-grained-tool-streaming-2025-05-14` needs nothing: tool inputs are never buffered or validated, Gemini just sends each call whole.
 - Not supported yet: images / PDFs / documents, extended thinking, prompt caching, server tools (web search, code execution...), the `mcp_servers` connector, `count_tokens`, batches, the async client.
 - Gemini 3 models need a "thought signature" when a tool call is sent back. It is kept as an extra `gemini_thought_signature` field on the returned `ToolUseBlock`; for hand-written history a placeholder is sent instead.

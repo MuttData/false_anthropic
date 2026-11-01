@@ -590,7 +590,34 @@ class FalseAnthropicMessages:
         )
 
 
+class FalseAnthropicBetaMessages:
+    """`client.beta.messages`: same methods as `client.messages`, plus the `betas` argument.
+
+    The betas are accepted and ignored: Gemini has no equivalent flags, and the behavior they enable either already
+    matches (e.g. `fine-grained-tool-streaming-2025-05-14`, Gemini sends tool inputs unbuffered as whole calls)
+    or is not supported by this library.
+    """
+
+    def __init__(self, messages: FalseAnthropicMessages):
+        self._messages = messages
+
+    def create(self, *, betas: list[str] | None = None, **kwargs: Any) -> anthropic.types.Message | FalseStream:
+        return self._messages.create(**kwargs)
+
+    def stream(self, *, betas: list[str] | None = None, **kwargs: Any) -> MessageStreamManager:
+        return self._messages.stream(**kwargs)
+
+    def parse(self, *, betas: list[str] | None = None, **kwargs: Any) -> anthropic.types.ParsedMessage:
+        return self._messages.parse(**kwargs)
+
+
+class FalseAnthropicBeta:
+    def __init__(self, messages: FalseAnthropicMessages):
+        self.messages = FalseAnthropicBetaMessages(messages)
+
+
 class FalseAnthropic:
     def __init__(self, api_key: str | None = None):
         self.client = genai.Client(api_key=api_key)
         self.messages = FalseAnthropicMessages(self.client)
+        self.beta = FalseAnthropicBeta(self.messages)
