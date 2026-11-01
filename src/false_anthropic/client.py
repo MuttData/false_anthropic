@@ -15,6 +15,8 @@ from google import genai
 from pydantic import TypeAdapter
 from google.genai import types
 
+from false_anthropic.tool_schemas import resolve_client_tool
+
 
 class AnthropicTextBlock(TypedDict):
     type: Literal["text"]
@@ -542,9 +544,9 @@ class FalseAnthropicMessages:
         tool_choice: AnthropicToolChoice | None,
         output_config: AnthropicOutputConfig | None,
     ) -> types.GenerateContentConfig:
-        system_instruction = None
-        if system is not None:
-            system_instruction = "\n".join(block["text"] for block in self._blocks_from_content(system))
+        tools, tool_system_prompts = self._resolve_client_tools(tools)
+        system_texts = [block["text"] for block in self._blocks_from_content(system)] if system is not None else []
+        system_instruction = "\n\n".join([*system_texts, *tool_system_prompts]) or None
         # `output_config["effort"]` has no direct Gemini equivalent and is ignored
         output_format = (output_config or {}).get("format")
         if output_format is not None and output_format["type"] != "json_schema":
@@ -562,13 +564,29 @@ class FalseAnthropicMessages:
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
+    def _resolve_client_tools(self, tools: list[AnthropicTool] | None) -> tuple[list[AnthropicTool] | None, list[str]]:
+        """Replaces the Anthropic-defined client tools (text editor, bash, memory) with regular tools carrying
+        their schema, since they are schema-less on Anthropic's side. Also returns the system prompt text that
+        Anthropic's API adds for them.
+        """
+        if not tools:
+            return tools, []
+        resolved, system_prompts = [], []
+        for tool in tools:
+            if tool.get("type", "custom") == "custom":
+                resolved.append(tool)
+                continue
+            schema = resolve_client_tool(tool)
+            resolved.append({"name": schema.name, "description": schema.description, "input_schema": schema.input_schema})
+            if schema.system_prompt:
+                system_prompts.append(schema.system_prompt)
+        return resolved, system_prompts
+
     def _genai_tools(self, tools: list[AnthropicTool] | None) -> list[types.Tool] | None:
         if not tools:
             return None
         declarations = []
         for tool in tools:
-            if tool.get("type", "custom") != "custom":
-                raise NotImplementedError(f"Server tool {tool['type']!r} is not supported yet")
             declarations.append(
                 types.FunctionDeclaration(
                     name=tool["name"],

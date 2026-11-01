@@ -54,6 +54,8 @@ uv sync
 uv run examples/tool_use.py
 ```
 
+The tests run offline: `uv run pytest`.
+
 ## Supported
 
 | Feature | Notes |
@@ -62,12 +64,26 @@ uv run examples/tool_use.py
 | Multi-turn chats | `user` / `assistant` roles, string or text block content, `response.content` can be appended back to the history |
 | Prefill | ending `messages` with an assistant message makes the model continue from it (emulated, see below) |
 | Tool use | `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`), `tool_use` / `tool_result` blocks, parallel tool calls, `is_error` |
+| Anthropic-defined client tools | `text_editor_20250728` / `_20250429` / `_20250124`, `bash_20250124`, `memory_20250818`: pass `{"type": ..., "name": ...}` as usual, see below |
 | Streaming | `create(..., stream=True)` raw events and the `messages.stream()` helper (`text_stream`, `get_final_message()`, ...) |
 | Structured outputs | `output_config={"format": {"type": "json_schema", ...}}`, `messages.parse(output_format=Model)` and `messages.stream(output_format=Model)` |
 | Beta API | `client.beta.messages.create` / `stream` / `parse` with `betas=[...]`; the betas are accepted and ignored (see below) |
 | MCP | client-side MCP (listing an MCP server's tools and passing them as `tools`), since it is regular tool use |
 
 Responses are real `anthropic.types.Message` objects, with `stop_reason` and `usage` mapped from the Gemini response.
+
+## Anthropic-defined client tools
+
+The text editor, bash and memory tools are schema-less on Anthropic's API: the schema is built into Claude's model. Gemini needs one, so [`tool_schemas.py`](src/false_anthropic/tool_schemas.py) rebuilds each schema from the parameters described in Anthropic's docs, and `{"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"}` is replaced with a regular tool with that schema. Gemini then calls it with the same `name` and `input` shape as Claude, so your handlers work unchanged.
+
+| `type` | Required `name` | Commands |
+| --- | --- | --- |
+| `text_editor_20250728`, `text_editor_20250429` | `str_replace_based_edit_tool` | `view`, `create`, `str_replace`, `insert` (with `insert_text`); `max_characters` is supported on `20250728` |
+| `text_editor_20250124` | `str_replace_editor` | the same plus `undo_edit`, and `insert` uses `new_str` |
+| `bash_20250124` | `bash` | `command`, `restart` |
+| `memory_20250818` | `memory` | `view`, `create`, `str_replace`, `insert`, `delete`, `rename`; Anthropic's memory system prompt is added too |
+
+Claude is trained on these tools while Gemini only gets the schema and its description, so expect Gemini to use them a bit differently. Server tools (web search, code execution...) and the computer / browser use tools are not supported.
 
 ## Differences and limitations
 
