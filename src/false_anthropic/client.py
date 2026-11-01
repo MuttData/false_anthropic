@@ -15,6 +15,7 @@ from google import genai
 from pydantic import TypeAdapter
 from google.genai import types
 
+from false_anthropic import web_search
 from false_anthropic.tool_schemas import resolve_client_tool
 
 
@@ -257,6 +258,7 @@ class FalseAnthropicMessages:
             if block["type"] == "tool_use"
         }
         genai_messages = [self._from_anthropic_to_genai(m, tool_names) for m in messages]
+        genai_messages = [m for m in genai_messages if m is not None]
         genai_config = self._from_anthropic_to_genai_config(
             max_tokens=max_tokens,
             system=system,
@@ -266,6 +268,17 @@ class FalseAnthropicMessages:
             tool_choice=tool_choice,
             output_config=output_config,
         )
+
+        if stream and any(web_search.is_web_search_tool(tool) for tool in tools or []):
+            # Gemini only sends the search results in the last chunk, while Anthropic sends them before the answer
+            # text, so the whole response is needed first. It is then replayed as stream events.
+            response = self.client.models.generate_content(
+                model=model,
+                contents=genai_messages,
+                config=genai_config
+            )
+            message = self._from_genai_to_anthropic(response, model=model, continuation=continuation)
+            return FalseStream(self._events_from_message(message))
 
         if stream:
             chunks = self.client.models.generate_content_stream(
@@ -288,14 +301,12 @@ class FalseAnthropicMessages:
             raise ValueError("A final assistant message (prefill) can only contain text")
         return "".join(block["text"] for block in blocks)
 
-    def _from_anthropic_to_genai(self, message: AnthropicMessage, tool_names: dict[str, str]) -> types.Content:
-        return types.Content(
-            role=_ROLES_TO_GENAI[message["role"]],
-            parts=[
-                self._part_from_block(block, tool_names)
-                for block in self._blocks_from_content(message["content"])
-            ],
-        )
+    def _from_anthropic_to_genai(self, message: AnthropicMessage, tool_names: dict[str, str]) -> types.Content | None:
+        parts = [self._part_from_block(block, tool_names) for block in self._blocks_from_content(message["content"])]
+        parts = [part for part in parts if part is not None]
+        if not parts:
+            return None
+        return types.Content(role=_ROLES_TO_GENAI[message["role"]], parts=parts)
 
     def _blocks_from_content(self, content: str | Iterable[AnthropicContentBlock]) -> list[dict[str, Any]]:
         if isinstance(content, str):
@@ -303,8 +314,11 @@ class FalseAnthropicMessages:
         # accept both plain dicts and the pydantic blocks returned in `Message.content`
         return [block if isinstance(block, dict) else block.model_dump() for block in content]
 
-    def _part_from_block(self, block: dict[str, Any], tool_names: dict[str, str]) -> types.Part:
+    def _part_from_block(self, block: dict[str, Any], tool_names: dict[str, str]) -> types.Part | None:
         match block["type"]:
+            case "server_tool_use" | "web_search_tool_result":
+                # Gemini can't take its searches back as input, the answer text carries what was found
+                return None
             case "text":
                 return types.Part.from_text(text=block["text"])
             case "tool_use":
@@ -357,6 +371,15 @@ class FalseAnthropicMessages:
                 else:
                     content.append(anthropic.types.TextBlock(type="text", text=part.text))
 
+        grounding = candidate.grounding_metadata if candidate else None
+        if web_search.has_web_search(grounding):
+            if any(block.type == "tool_use" for block in content) or continuation is not None:
+                text_blocks = content  # keep it simple, citations only for plain answers
+            else:
+                part_texts = [part.text if part.text and not part.thought else "" for part in parts]
+                text_blocks = web_search.cited_text_blocks(part_texts, grounding)
+            content = [*web_search.search_blocks(grounding), *text_blocks]
+
         if continuation is not None:
             continued = []
             for block in content:
@@ -369,14 +392,72 @@ class FalseAnthropicMessages:
 
         has_tool_use = any(block.type == "tool_use" for block in content)
         stop_sequence = continuation.stop_sequence if continuation else None
+        usage = self._usage(response.usage_metadata)
+        usage.server_tool_use = web_search.server_tool_usage(grounding)
         return self._message(
             response,
             model=model,
             content=content,
             stop_reason="stop_sequence" if stop_sequence else self._stop_reason(candidate, has_tool_use),
             stop_sequence=stop_sequence,
-            usage=self._usage(response.usage_metadata),
+            usage=usage,
         )
+
+    def _events_from_message(self, message: anthropic.types.Message) -> Iterator[anthropic.types.RawMessageStreamEvent]:
+        """Replays a complete message as the Anthropic raw stream events that would have produced it."""
+        yield anthropic.types.RawMessageStartEvent(
+            type="message_start",
+            message=message.model_copy(
+                update={
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": anthropic.types.Usage(input_tokens=message.usage.input_tokens, output_tokens=0),
+                }
+            ),
+        )
+        for index, block in enumerate(message.content):
+            if block.type == "text":
+                yield anthropic.types.RawContentBlockStartEvent(
+                    type="content_block_start",
+                    index=index,
+                    content_block=anthropic.types.TextBlock(type="text", text="", citations=[] if block.citations else None),
+                )
+                for citation in block.citations or []:
+                    yield anthropic.types.RawContentBlockDeltaEvent(
+                        type="content_block_delta",
+                        index=index,
+                        delta=anthropic.types.CitationsDelta(type="citations_delta", citation=citation),
+                    )
+                yield anthropic.types.RawContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=index,
+                    delta=anthropic.types.TextDelta(type="text_delta", text=block.text),
+                )
+            elif block.type in ("tool_use", "server_tool_use"):
+                yield anthropic.types.RawContentBlockStartEvent(
+                    type="content_block_start", index=index, content_block=block.model_copy(update={"input": {}})
+                )
+                yield anthropic.types.RawContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=index,
+                    delta=anthropic.types.InputJSONDelta(type="input_json_delta", partial_json=json.dumps(block.input)),
+                )
+            else:
+                yield anthropic.types.RawContentBlockStartEvent(type="content_block_start", index=index, content_block=block)
+            yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
+
+        yield anthropic.types.RawMessageDeltaEvent(
+            type="message_delta",
+            delta=Delta(stop_reason=message.stop_reason, stop_sequence=message.stop_sequence),
+            usage=anthropic.types.MessageDeltaUsage(
+                input_tokens=message.usage.input_tokens,
+                output_tokens=message.usage.output_tokens,
+                cache_read_input_tokens=message.usage.cache_read_input_tokens,
+                server_tool_use=message.usage.server_tool_use,
+            ),
+        )
+        yield anthropic.types.RawMessageStopEvent(type="message_stop")
 
     def _message(
         self,
@@ -544,6 +625,8 @@ class FalseAnthropicMessages:
         tool_choice: AnthropicToolChoice | None,
         output_config: AnthropicOutputConfig | None,
     ) -> types.GenerateContentConfig:
+        builtin_tools = [web_search.google_search_tool(tool) for tool in tools or [] if web_search.is_web_search_tool(tool)]
+        tools = [tool for tool in tools or [] if not web_search.is_web_search_tool(tool)]
         tools, tool_system_prompts = self._resolve_client_tools(tools)
         system_texts = [block["text"] for block in self._blocks_from_content(system)] if system is not None else []
         system_instruction = "\n\n".join([*system_texts, *tool_system_prompts]) or None
@@ -558,7 +641,7 @@ class FalseAnthropicMessages:
             system_instruction=system_instruction,
             temperature=temperature,
             stop_sequences=stop_sequences,
-            tools=self._genai_tools(tools),
+            tools=[*(self._genai_tools(tools) or []), *builtin_tools] or None,
             tool_config=self._genai_tool_config(tool_choice),
             # the exercises run the tools themselves, like with the Anthropic SDK
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),

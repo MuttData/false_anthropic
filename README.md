@@ -64,6 +64,7 @@ The tests run offline: `uv run pytest`.
 | Multi-turn chats | `user` / `assistant` roles, string or text block content, `response.content` can be appended back to the history |
 | Prefill | ending `messages` with an assistant message makes the model continue from it (emulated, see below) |
 | Tool use | `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`), `tool_use` / `tool_result` blocks, parallel tool calls, `is_error` |
+| Web search | `web_search_20250305` / `_20260209` / `_20260318` through Google Search, with search result blocks and citations (see below) |
 | Anthropic-defined client tools | `text_editor_20250728` / `_20250429` / `_20250124`, `bash_20250124`, `memory_20250818`: pass `{"type": ..., "name": ...}` as usual, see below |
 | Streaming | `create(..., stream=True)` raw events and the `messages.stream()` helper (`text_stream`, `get_final_message()`, ...) |
 | Structured outputs | `output_config={"format": {"type": "json_schema", ...}}`, `messages.parse(output_format=Model)` and `messages.stream(output_format=Model)` |
@@ -83,7 +84,19 @@ The text editor, bash and memory tools are schema-less on Anthropic's API: the s
 | `bash_20250124` | `bash` | `command`, `restart` |
 | `memory_20250818` | `memory` | `view`, `create`, `str_replace`, `insert`, `delete`, `rename`; Anthropic's memory system prompt is added too |
 
-Claude is trained on these tools while Gemini only gets the schema and its description, so expect Gemini to use them a bit differently. Server tools (web search, code execution...) and the computer / browser use tools are not supported.
+Claude is trained on these tools while Gemini only gets the schema and its description, so expect Gemini to use them a bit differently. Other server tools (code execution, web fetch...) and the computer / browser use tools are not supported.
+
+## Web search
+
+`{"type": "web_search_20250305", "name": "web_search"}` (or `web_search_20260209` / `web_search_20260318`) runs as Gemini's Google Search grounding, see [`web_search.py`](src/false_anthropic/web_search.py). The response is mapped to Anthropic's shape:
+
+- each search Gemini made becomes a `server_tool_use` block followed by a `web_search_tool_result` block with the sources as `web_search_result`s,
+- the answer is split into text blocks, with `web_search_result_location` citations on the parts Gemini grounded,
+- `usage.server_tool_use.web_search_requests` counts the searches.
+
+Differences: Gemini does not say which search found which source, so all sources are in the first result block; result URLs are Google redirect links and titles are usually the domain; `encrypted_content` / `encrypted_index` are empty and `cited_text` is the cited part of the answer, not a quote from the page; `max_uses`, `allowed_domains`, `blocked_domains` and `user_location` are ignored with a warning. When streaming, the response is fetched whole and then replayed as events, since Gemini only sends the sources at the end.
+
+**Quota:** Google Search grounding has its own quota, and free tier keys may get `429 RESOURCE_EXHAUSTED` on every search request even when regular requests work. Check your limits at <https://ai.dev/rate-limit>.
 
 ## Differences and limitations
 
@@ -93,5 +106,5 @@ Claude is trained on these tools while Gemini only gets the schema and its descr
 - Structured output schemas are sent to Gemini as they are, so constraints like `minimum` / `maximum` are enforced by the model.
 - `output_config["effort"]` and `tool_choice["disable_parallel_tool_use"]` are ignored.
 - `betas` are ignored and `client.beta.messages` returns the regular (non `Beta*`) types, which have the same fields. `fine-grained-tool-streaming-2025-05-14` needs nothing: tool inputs are never buffered or validated, Gemini just sends each call whole.
-- Not supported yet: images / PDFs / documents, extended thinking, prompt caching, server tools (web search, code execution...), the `mcp_servers` connector, `count_tokens`, batches, the async client.
+- Not supported yet: images / PDFs / documents, extended thinking, prompt caching, server tools other than web search (code execution, web fetch...), the `mcp_servers` connector, `count_tokens`, batches, the async client.
 - Gemini 3 models need a "thought signature" when a tool call is sent back. It is kept as an extra `gemini_thought_signature` field on the returned `ToolUseBlock`; for hand-written history a placeholder is sent instead.

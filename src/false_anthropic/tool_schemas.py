@@ -196,7 +196,7 @@ def resolve_client_tool(tool: dict[str, Any]) -> ClientToolSchema:
     if tool_type not in CLIENT_TOOLS:
         raise NotImplementedError(
             f"Tool type {tool_type!r} is not supported. "
-            f"Supported Anthropic-defined tools: {', '.join(sorted(CLIENT_TOOLS))}"
+            f"Supported Anthropic-defined tools: {', '.join(sorted(CLIENT_TOOLS))}, and web search"
         )
     schema = CLIENT_TOOLS[tool_type](tool)
     # like Anthropic's API, which only accepts the name the model was trained with

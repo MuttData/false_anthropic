@@ -62,8 +62,8 @@ def test_resolve_checks_the_name():
 
 
 def test_resolve_rejects_unsupported_tools():
-    with pytest.raises(NotImplementedError, match="web_search_20250305"):
-        resolve_client_tool({"type": "web_search_20250305", "name": "web_search"})
+    with pytest.raises(NotImplementedError, match="code_execution_20250825"):
+        resolve_client_tool({"type": "code_execution_20250825", "name": "code_execution"})
 
 
 def test_client_replaces_tools_and_adds_the_memory_prompt():
