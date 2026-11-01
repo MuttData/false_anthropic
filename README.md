@@ -62,6 +62,8 @@ The tests run offline: `uv run pytest`.
 | --- | --- |
 | `messages.create` | `model`, `max_tokens`, `messages`, `system`, `temperature`, `stop_sequences` |
 | Multi-turn chats | `user` / `assistant` roles, string or text block content, `response.content` can be appended back to the history |
+| Images | `image` blocks with a `base64` or `url` source, in user messages and in `tool_result` content (see below) |
+| Documents | `document` blocks: PDFs (`base64` / `url`), plain text and custom content, with `title`, `context` and citations (emulated, see below) |
 | Prefill | ending `messages` with an assistant message makes the model continue from it (emulated, see below) |
 | Tool use | `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`), `tool_use` / `tool_result` blocks, parallel tool calls, `is_error` |
 | Web search | `web_search_20250305` / `_20260209` / `_20260318` through Google Search, with search result blocks and citations (see below) |
@@ -73,6 +75,36 @@ The tests run offline: `uv run pytest`.
 | MCP | client-side MCP (listing an MCP server's tools and passing them as `tools`), since it is regular tool use |
 
 Responses are real `anthropic.types.Message` objects, with `stop_reason` and `usage` mapped from the Gemini response.
+
+## Images
+
+Image blocks are sent to Gemini as inline image data:
+
+- `{"type": "base64", "media_type": "image/png", "data": ...}` sources are sent as they are.
+- `{"type": "url", "url": ...}` sources are downloaded by the library first (Gemini can't fetch arbitrary URLs), and the media type comes from the response's `Content-Type`.
+- Images in a `tool_result`'s `content` are sent as parts of the Gemini function response, next to the result text. This needs a Gemini 3 model.
+
+`file` sources (Anthropic's Files API) are not supported, and `cache_control` / `transformations` are ignored. Gemini counts image tokens differently from Claude, so `usage.input_tokens` won't match what Claude would report.
+
+## Documents and citations
+
+`document` blocks in user messages work like in [Anthropic's API](https://platform.claude.com/docs/en/build-with-claude/pdf-support):
+
+- PDFs, with a `{"type": "base64", "media_type": "application/pdf", ...}` or `{"type": "url", ...}` source (downloaded by the library), are sent to Gemini as PDFs, so it reads both the text and the images.
+- Plain text (`{"type": "text", "media_type": "text/plain", "data": ...}`) and custom content (`{"type": "content", "content": [...]}`, text and image blocks) documents are sent as text, with images in custom content sent as images.
+- `title` and `context` are shown to the model with the document.
+
+Gemini has no document citations, so `"citations": {"enabled": true}` is emulated, see [`documents.py`](src/false_anthropic/documents.py). Each document is split into sentences, or into its blocks for custom content. PDFs are split using the text that [pypdf](https://pypi.org/project/pypdf/) extracts from each page. The model sees the sentences with ids and is asked to cite them with markers, which are parsed into text blocks with citations, as [Claude returns them](https://platform.claude.com/docs/en/build-with-claude/citations):
+
+| Document | Citation | Location |
+| --- | --- | --- |
+| Plain text | `char_location` | `start_char_index` / `end_char_index`, 0-indexed, end exclusive |
+| PDF | `page_location` | `start_page_number` / `end_page_number`, 1-indexed, end exclusive |
+| Custom content | `content_block_location` | `start_block_index` / `end_block_index`, 0-indexed, end exclusive |
+
+`cited_text` and the locations come from the document, not from the model, so they are always exact. `document_index` counts the documents across all messages, consecutive cited sentences become one citation, and streaming sends `citations_delta`s (the response is fetched whole and replayed, since a marker can be split across chunks). Like the API, citations must be enabled on all or none of the documents, and can't be combined with structured outputs.
+
+Differences: which sentences get cited depends on Gemini following the instructions, so it can cite less precisely than Claude or not at all. A cited block is the statement before the marker, from the end of the previous sentence. With citations enabled, a PDF is sent twice (as a PDF and as the extracted sentences), which uses more input tokens. `file` sources (Files API) and documents inside `tool_result`s are not supported, and `cache_control` is ignored.
 
 ## Anthropic-defined client tools
 
@@ -119,5 +151,5 @@ Differences: Gemini returns a summary of its thoughts, not the full reasoning (C
 - Structured output schemas are sent to Gemini as they are, so constraints like `minimum` / `maximum` are enforced by the model.
 - `output_config["effort"]` and `tool_choice["disable_parallel_tool_use"]` are ignored.
 - `betas` are ignored and `client.beta.messages` returns the regular (non `Beta*`) types, which have the same fields. `fine-grained-tool-streaming-2025-05-14` needs nothing: tool inputs are never buffered or validated, Gemini just sends each call whole.
-- Not supported yet: images / PDFs / documents, `thinking={"type": "between_tools"}`, prompt caching, server tools other than web search (code execution, web fetch...), the `mcp_servers` connector, `count_tokens`, batches, the async client.
+- Not supported yet: `file` sources (Files API), `search_result` blocks, `thinking={"type": "between_tools"}`, prompt caching, server tools other than web search (code execution, web fetch...), the `mcp_servers` connector, `count_tokens`, batches, the async client.
 - Gemini 3 models need a "thought signature" when a tool call is sent back. It is kept as an extra `gemini_thought_signature` field on the returned `ToolUseBlock`; for hand-written history a placeholder is sent instead.

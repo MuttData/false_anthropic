@@ -16,7 +16,7 @@ from google import genai
 from pydantic import TypeAdapter
 from google.genai import types
 
-from false_anthropic import web_search
+from false_anthropic import documents, sources, web_search
 from false_anthropic.tool_schemas import resolve_client_tool
 
 
@@ -276,7 +276,18 @@ class FalseAnthropicMessages:
             for block in self._blocks_from_content(message["content"])
             if block["type"] == "tool_use"
         }
-        genai_messages = [self._from_anthropic_to_genai(m, tool_names) for m in messages]
+        request_documents = documents.load_documents(
+            block for message in messages for block in self._blocks_from_content(message["content"])
+        )
+        # the documents to parse the citations of, when citations are enabled
+        cited_documents = request_documents if any(d.citations for d in request_documents) else None
+        if cited_documents and (output_config or {}).get("format"):
+            # like Anthropic's API, which returns a 400 error
+            raise ValueError("Citations can't be enabled on documents when using structured outputs")
+
+        # the document blocks are converted in the same order they were loaded
+        documents_iter = iter(request_documents)
+        genai_messages = [self._from_anthropic_to_genai(m, tool_names, documents_iter) for m in messages]
         genai_messages = [m for m in genai_messages if m is not None]
         genai_config = self._from_anthropic_to_genai_config(
             max_tokens=max_tokens,
@@ -287,18 +298,24 @@ class FalseAnthropicMessages:
             tool_choice=tool_choice,
             output_config=output_config,
             thinking=thinking,
+            citations=cited_documents is not None,
         )
 
-        if stream and any(web_search.is_web_search_tool(tool) for tool in tools or []):
+        if stream and (cited_documents or any(web_search.is_web_search_tool(tool) for tool in tools or [])):
             # Gemini only sends the search results in the last chunk, while Anthropic sends them before the answer
-            # text, so the whole response is needed first. It is then replayed as stream events.
+            # text, and citation markers can be split across chunks, so the whole response is needed first.
+            # It is then replayed as stream events.
             response = self.client.models.generate_content(
                 model=model,
                 contents=genai_messages,
                 config=genai_config
             )
             message = self._from_genai_to_anthropic(
-                response, model=model, continuation=continuation, thinking_display=thinking_display
+                response,
+                model=model,
+                continuation=continuation,
+                thinking_display=thinking_display,
+                cited_documents=cited_documents,
             )
             return FalseStream(self._events_from_message(message))
 
@@ -318,7 +335,11 @@ class FalseAnthropicMessages:
             config=genai_config
         )
         return self._from_genai_to_anthropic(
-            response, model=model, continuation=continuation, thinking_display=thinking_display
+            response,
+            model=model,
+            continuation=continuation,
+            thinking_display=thinking_display,
+            cited_documents=cited_documents,
         )
 
     def _thinking_display(
@@ -348,9 +369,18 @@ class FalseAnthropicMessages:
             raise ValueError("A final assistant message (prefill) can only contain text")
         return "".join(block["text"] for block in blocks)
 
-    def _from_anthropic_to_genai(self, message: AnthropicMessage, tool_names: dict[str, str]) -> types.Content | None:
-        parts = [self._part_from_block(block, tool_names) for block in self._blocks_from_content(message["content"])]
-        parts = [part for part in parts if part is not None]
+    def _from_anthropic_to_genai(
+        self,
+        message: AnthropicMessage,
+        tool_names: dict[str, str],
+        documents_iter: Iterator[documents.Document],
+    ) -> types.Content | None:
+        parts = []
+        for block in self._blocks_from_content(message["content"]):
+            if block["type"] == "document":
+                parts.extend(next(documents_iter).genai_parts())
+            elif (part := self._part_from_block(block, tool_names)) is not None:
+                parts.append(part)
         if not parts:
             return None
         return types.Content(role=_ROLES_TO_GENAI[message["role"]], parts=parts)
@@ -372,6 +402,9 @@ class FalseAnthropicMessages:
                 return None
             case "text":
                 return types.Part.from_text(text=block["text"])
+            case "image":
+                data, media_type = sources.image_bytes(block["source"])
+                return types.Part.from_bytes(data=data, mime_type=media_type)
             case "tool_use":
                 return types.Part(
                     function_call=types.FunctionCall(id=block["id"], name=block["name"], args=block["input"]),
@@ -381,24 +414,33 @@ class FalseAnthropicMessages:
                 tool_use_id = block["tool_use_id"]
                 if tool_use_id not in tool_names:
                     raise ValueError(f"tool_result {tool_use_id!r} has no matching tool_use block in the messages")
-                result = self._tool_result_text(block.get("content", ""))
+                result, images = self._tool_result_content(block.get("content", ""))
                 return types.Part(
                     function_response=types.FunctionResponse(
                         id=tool_use_id,
                         name=tool_names[tool_use_id],
                         response={"error": result} if block.get("is_error") else {"output": result},
+                        parts=images or None,
                     )
                 )
             case other:
                 raise NotImplementedError(f"Content block type {other!r} is not supported yet")
 
-    def _tool_result_text(self, content: str | Iterable[AnthropicTextBlock]) -> str:
-        texts = []
+    def _tool_result_content(
+        self, content: str | Iterable[AnthropicContentBlock]
+    ) -> tuple[str, list[types.FunctionResponsePart]]:
+        """Splits a tool result into its text and its images, which Gemini takes as function response parts."""
+        texts, images = [], []
         for block in self._blocks_from_content(content):
-            if block["type"] != "text":
-                raise NotImplementedError(f"Tool result block type {block['type']!r} is not supported yet")
-            texts.append(block["text"])
-        return "\n".join(texts)
+            match block["type"]:
+                case "text":
+                    texts.append(block["text"])
+                case "image":
+                    data, media_type = sources.image_bytes(block["source"])
+                    images.append(types.FunctionResponsePart.from_bytes(data=data, mime_type=media_type))
+                case other:
+                    raise NotImplementedError(f"Tool result block type {other!r} is not supported yet")
+        return "\n".join(texts), images
 
     def _from_genai_to_anthropic(
         self,
@@ -407,6 +449,7 @@ class FalseAnthropicMessages:
         model: str,
         continuation: _PrefillContinuation | None = None,
         thinking_display: ThinkingDisplay | None = None,
+        cited_documents: list[documents.Document] | None = None,
     ) -> anthropic.types.Message:
         candidate = response.candidates[0] if response.candidates else None
         parts = candidate.content.parts if candidate and candidate.content and candidate.content.parts else []
@@ -435,8 +478,8 @@ class FalseAnthropicMessages:
         grounding = candidate.grounding_metadata if candidate else None
         if web_search.has_web_search(grounding):
             thinking_blocks = [block for block in content if block.type in ("thinking", "redacted_thinking")]
-            if any(block.type == "tool_use" for block in content) or continuation is not None:
-                # keep it simple, citations only for plain answers
+            if any(block.type == "tool_use" for block in content) or continuation is not None or cited_documents:
+                # keep it simple, search citations only for plain answers
                 text_blocks = [block for block in content if block.type not in ("thinking", "redacted_thinking")]
             else:
                 part_texts = [part.text if part.text and not part.thought else "" for part in parts]
@@ -453,6 +496,15 @@ class FalseAnthropicMessages:
                     block.text = continuation.feed(block.text) + continuation.flush()
                 continued.append(block)
             content = continued
+
+        if cited_documents:
+            content = [
+                cited_block
+                for block in content
+                for cited_block in (
+                    documents.cited_text_blocks(block.text, cited_documents) if block.type == "text" else [block]
+                )
+            ]
 
         has_tool_use = any(block.type == "tool_use" for block in content)
         stop_sequence = continuation.stop_sequence if continuation else None
@@ -745,12 +797,14 @@ class FalseAnthropicMessages:
         tool_choice: AnthropicToolChoice | None,
         output_config: AnthropicOutputConfig | None,
         thinking: AnthropicThinkingConfig | None = None,
+        citations: bool = False,
     ) -> types.GenerateContentConfig:
         builtin_tools = [web_search.google_search_tool(tool) for tool in tools or [] if web_search.is_web_search_tool(tool)]
         tools = [tool for tool in tools or [] if not web_search.is_web_search_tool(tool)]
         tools, tool_system_prompts = self._resolve_client_tools(tools)
         system_texts = [block["text"] for block in self._blocks_from_content(system)] if system is not None else []
-        system_instruction = "\n\n".join([*system_texts, *tool_system_prompts]) or None
+        citations_prompts = [documents.CITATIONS_SYSTEM_PROMPT] if citations else []
+        system_instruction = "\n\n".join([*system_texts, *tool_system_prompts, *citations_prompts]) or None
         # `output_config["effort"]` has no direct Gemini equivalent and is ignored
         output_format = (output_config or {}).get("format")
         if output_format is not None and output_format["type"] != "json_schema":
