@@ -67,6 +67,7 @@ The tests run offline: `uv run pytest`.
 | Web search | `web_search_20250305` / `_20260209` / `_20260318` through Google Search, with search result blocks and citations (see below) |
 | Anthropic-defined client tools | `text_editor_20250728` / `_20250429` / `_20250124`, `bash_20250124`, `memory_20250818`: pass `{"type": ..., "name": ...}` as usual, see below |
 | Streaming | `create(..., stream=True)` raw events and the `messages.stream()` helper (`text_stream`, `get_final_message()`, ...) |
+| Extended thinking | `thinking={"type": "enabled", "budget_tokens": N}` / `{"type": "adaptive"}` / `{"type": "disabled"}`, `display`, `thinking` / `redacted_thinking` blocks and streaming deltas (see below) |
 | Structured outputs | `output_config={"format": {"type": "json_schema", ...}}`, `messages.parse(output_format=Model)` and `messages.stream(output_format=Model)` |
 | Beta API | `client.beta.messages.create` / `stream` / `parse` with `betas=[...]`; the betas are accepted and ignored (see below) |
 | MCP | client-side MCP (listing an MCP server's tools and passing them as `tools`), since it is regular tool use |
@@ -98,6 +99,18 @@ Differences: Gemini does not say which search found which source, so all sources
 
 **Quota:** Google Search grounding has its own quota, and free tier keys may get `429 RESOURCE_EXHAUSTED` on every search request even when regular requests work. Check your limits at <https://ai.dev/rate-limit>.
 
+## Extended thinking
+
+Gemini's thinking models are available on the free tier, and `thinking` maps to Gemini's thinking config with the thoughts included in the response:
+
+- `{"type": "enabled", "budget_tokens": N}` sets Gemini's `thinking_budget` to `N`, `{"type": "adaptive"}` uses Gemini's dynamic thinking (the model decides, and may not think at all on easy prompts), and `{"type": "disabled"}` (or no `thinking`) leaves Gemini's default, with the thoughts left out of the response.
+- Gemini's thought summaries become a `thinking` block before the answer. `display: "omitted"` returns the block with empty `thinking`.
+- Like Anthropic's API, a user message containing `ANTHROPIC_MAGIC_STRING_TRIGGER_REDACTED_THINKING...` returns a `redacted_thinking` block instead, so you can test how your code handles one.
+- When streaming, the thoughts arrive as `thinking_delta`s followed by a `signature_delta`.
+- Thinking tokens are counted in `usage.output_tokens`, like Anthropic.
+
+Differences: Gemini returns a summary of its thoughts, not the full reasoning (Claude 4 models summarize too). The `signature` is Gemini's thought signature when it is attached to the thought, otherwise a placeholder, and `redacted_thinking` `data` is a random value. Thinking blocks sent back in `messages` are accepted and dropped, since Gemini only needs the signatures of the tool calls (kept on the `tool_use` blocks). Anthropic's rules (budget at least 1024 and below `max_tokens`, no prefill or forced tool use with thinking, `temperature` 1) are not enforced. Whether a model can think, and its budget limits, depend on the Gemini model.
+
 ## Differences and limitations
 
 - Gemini rejects requests ending with an assistant message, so prefill is emulated: a user turn asking the model to continue is added, any repeated prefill text is stripped from the output, and stop sequences are applied by the library (so `stop_reason="stop_sequence"` and `stop_sequence` are reported). It is reliable for typical cases like prefilling ` ```json ` with stop sequence ` ``` `, but it is the model following an instruction, not a true continuation.
@@ -106,5 +119,5 @@ Differences: Gemini does not say which search found which source, so all sources
 - Structured output schemas are sent to Gemini as they are, so constraints like `minimum` / `maximum` are enforced by the model.
 - `output_config["effort"]` and `tool_choice["disable_parallel_tool_use"]` are ignored.
 - `betas` are ignored and `client.beta.messages` returns the regular (non `Beta*`) types, which have the same fields. `fine-grained-tool-streaming-2025-05-14` needs nothing: tool inputs are never buffered or validated, Gemini just sends each call whole.
-- Not supported yet: images / PDFs / documents, extended thinking, prompt caching, server tools other than web search (code execution, web fetch...), the `mcp_servers` connector, `count_tokens`, batches, the async client.
+- Not supported yet: images / PDFs / documents, `thinking={"type": "between_tools"}`, prompt caching, server tools other than web search (code execution, web fetch...), the `mcp_servers` connector, `count_tokens`, batches, the async client.
 - Gemini 3 models need a "thought signature" when a tool call is sent back. It is kept as an extra `gemini_thought_signature` field on the returned `ToolUseBlock`; for hand-written history a placeholder is sent instead.

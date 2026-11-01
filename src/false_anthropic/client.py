@@ -3,6 +3,7 @@ The Google GenAI client exposed as an Anthropic-compatible interface.
 The idea is to provide an alternative for the Anthropic certification exercises.
 """
 
+import base64
 import json
 import uuid
 from typing import Any, Iterable, Iterator, Literal, Mapping, NotRequired, TypedDict
@@ -80,6 +81,12 @@ class AnthropicOutputConfig(TypedDict, total=False):
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None
 
 
+class AnthropicThinkingConfig(TypedDict):
+    type: Literal["enabled", "adaptive", "disabled"]
+    budget_tokens: NotRequired[int]
+    display: NotRequired[Literal["summarized", "omitted"] | None]
+
+
 _ROLES_TO_GENAI = {"user": "user", "assistant": "model"}
 
 # Gemini finish reasons that have no 1:1 Anthropic equivalent are treated as refusals,
@@ -106,6 +113,16 @@ _TOOL_CHOICE_TO_GENAI_MODE = {
 # to Google's documented placeholder when the history was written by hand.
 _THOUGHT_SIGNATURE_FIELD = "gemini_thought_signature"
 _DUMMY_THOUGHT_SIGNATURE = b"skip_thought_signature_validator"
+
+
+# Gemini does not sign its thought summaries like Claude does, and thinking blocks are not sent back to Gemini,
+# so thinking blocks carry this placeholder unless Gemini attached a signature to the thought part itself
+_PLACEHOLDER_THINKING_SIGNATURE = base64.b64encode(b"false_anthropic_thinking").decode()
+
+# Sending this string makes Anthropic's API return `redacted_thinking` blocks, to test how a client handles them
+_REDACTED_THINKING_TRIGGER = "ANTHROPIC_MAGIC_STRING_TRIGGER_REDACTED_THINKING"
+
+ThinkingDisplay = Literal["summarized", "omitted", "redacted"]
 
 
 # Gemini rejects requests ending with a model turn, so a prefill is followed by this user turn
@@ -242,8 +259,10 @@ class FalseAnthropicMessages:
         tools: list[AnthropicTool] | None = None,
         tool_choice: AnthropicToolChoice | None = None,
         output_config: AnthropicOutputConfig | None = None,
+        thinking: AnthropicThinkingConfig | None = None,
         stream: bool = False,
     ) -> anthropic.types.Message | FalseStream:
+        thinking_display = self._thinking_display(thinking, messages)
         continuation = None
         if messages and messages[-1]["role"] == "assistant":
             continuation = _PrefillContinuation(self._prefill_text(messages[-1]), stop_sequences)
@@ -267,6 +286,7 @@ class FalseAnthropicMessages:
             tools=tools,
             tool_choice=tool_choice,
             output_config=output_config,
+            thinking=thinking,
         )
 
         if stream and any(web_search.is_web_search_tool(tool) for tool in tools or []):
@@ -277,7 +297,9 @@ class FalseAnthropicMessages:
                 contents=genai_messages,
                 config=genai_config
             )
-            message = self._from_genai_to_anthropic(response, model=model, continuation=continuation)
+            message = self._from_genai_to_anthropic(
+                response, model=model, continuation=continuation, thinking_display=thinking_display
+            )
             return FalseStream(self._events_from_message(message))
 
         if stream:
@@ -286,14 +308,39 @@ class FalseAnthropicMessages:
                 contents=genai_messages,
                 config=genai_config
             )
-            return FalseStream(self._stream_events(chunks, model=model, continuation=continuation))
+            return FalseStream(
+                self._stream_events(chunks, model=model, continuation=continuation, thinking_display=thinking_display)
+            )
 
         response = self.client.models.generate_content(
             model=model,
             contents=genai_messages,
             config=genai_config
         )
-        return self._from_genai_to_anthropic(response, model=model, continuation=continuation)
+        return self._from_genai_to_anthropic(
+            response, model=model, continuation=continuation, thinking_display=thinking_display
+        )
+
+    def _thinking_display(
+        self, thinking: AnthropicThinkingConfig | None, messages: list[AnthropicMessage]
+    ) -> ThinkingDisplay | None:
+        """How the thoughts are returned: as `thinking` blocks, with the text omitted, as `redacted_thinking` blocks,
+        or not at all (None) when thinking is not enabled.
+        """
+        if thinking is None or thinking["type"] == "disabled":
+            return None
+        if thinking["type"] not in ("enabled", "adaptive"):
+            raise NotImplementedError(f"Thinking type {thinking['type']!r} is not supported yet")
+        user_texts = (
+            block["text"]
+            for message in messages
+            if message["role"] == "user"
+            for block in self._blocks_from_content(message["content"])
+            if block["type"] == "text"
+        )
+        if any(_REDACTED_THINKING_TRIGGER in text for text in user_texts):
+            return "redacted"
+        return thinking.get("display") or "summarized"
 
     def _prefill_text(self, message: AnthropicMessage) -> str:
         blocks = self._blocks_from_content(message["content"])
@@ -318,6 +365,10 @@ class FalseAnthropicMessages:
         match block["type"]:
             case "server_tool_use" | "web_search_tool_result":
                 # Gemini can't take its searches back as input, the answer text carries what was found
+                return None
+            case "thinking" | "redacted_thinking":
+                # Gemini does not take its thought summaries back as input, it only needs the thought signatures
+                # (kept on the tool_use blocks)
                 return None
             case "text":
                 return types.Part.from_text(text=block["text"])
@@ -355,6 +406,7 @@ class FalseAnthropicMessages:
         *,
         model: str,
         continuation: _PrefillContinuation | None = None,
+        thinking_display: ThinkingDisplay | None = None,
     ) -> anthropic.types.Message:
         candidate = response.candidates[0] if response.candidates else None
         parts = candidate.content.parts if candidate and candidate.content and candidate.content.parts else []
@@ -363,8 +415,17 @@ class FalseAnthropicMessages:
         for part in parts:
             if part.function_call:
                 content.append(self._tool_use_from_function_call(part))
-            # skip the model "thought" parts, Anthropic only returns them when thinking is enabled
-            elif part.text and not part.thought:
+            elif part.text and part.thought:
+                # Anthropic only returns the thoughts when thinking is enabled
+                if thinking_display is None:
+                    continue
+                # merge consecutive thought parts into a single block
+                if content and content[-1].type in ("thinking", "redacted_thinking"):
+                    if content[-1].type == "thinking" and thinking_display != "omitted":
+                        content[-1].thinking += part.text
+                else:
+                    content.append(self._thinking_block(part, thinking_display))
+            elif part.text:
                 # merge consecutive text parts into a single block, like Anthropic does
                 if content and content[-1].type == "text":
                     content[-1].text += part.text
@@ -373,12 +434,15 @@ class FalseAnthropicMessages:
 
         grounding = candidate.grounding_metadata if candidate else None
         if web_search.has_web_search(grounding):
+            thinking_blocks = [block for block in content if block.type in ("thinking", "redacted_thinking")]
             if any(block.type == "tool_use" for block in content) or continuation is not None:
-                text_blocks = content  # keep it simple, citations only for plain answers
+                # keep it simple, citations only for plain answers
+                text_blocks = [block for block in content if block.type not in ("thinking", "redacted_thinking")]
             else:
                 part_texts = [part.text if part.text and not part.thought else "" for part in parts]
                 text_blocks = web_search.cited_text_blocks(part_texts, grounding)
-            content = [*web_search.search_blocks(grounding), *text_blocks]
+            # like Claude, the thinking comes before the searches
+            content = [*thinking_blocks, *web_search.search_blocks(grounding), *text_blocks]
 
         if continuation is not None:
             continued = []
@@ -401,6 +465,22 @@ class FalseAnthropicMessages:
             stop_reason="stop_sequence" if stop_sequence else self._stop_reason(candidate, has_tool_use),
             stop_sequence=stop_sequence,
             usage=usage,
+        )
+
+    def _thinking_block(
+        self, part: types.Part, thinking_display: ThinkingDisplay
+    ) -> anthropic.types.ThinkingBlock | anthropic.types.RedactedThinkingBlock:
+        """The block for the first thought part of a run of them (the following ones are merged into it)."""
+        if thinking_display == "redacted":
+            # Claude's redacted thinking is encrypted, so the content is just an opaque value here
+            return anthropic.types.RedactedThinkingBlock(
+                type="redacted_thinking", data=base64.b64encode(uuid.uuid4().bytes).decode()
+            )
+        signature = (
+            base64.b64encode(part.thought_signature).decode() if part.thought_signature else _PLACEHOLDER_THINKING_SIGNATURE
+        )
+        return anthropic.types.ThinkingBlock(
+            type="thinking", thinking="" if thinking_display == "omitted" else part.text, signature=signature
         )
 
     def _events_from_message(self, message: anthropic.types.Message) -> Iterator[anthropic.types.RawMessageStreamEvent]:
@@ -433,6 +513,23 @@ class FalseAnthropicMessages:
                     type="content_block_delta",
                     index=index,
                     delta=anthropic.types.TextDelta(type="text_delta", text=block.text),
+                )
+            elif block.type == "thinking":
+                yield anthropic.types.RawContentBlockStartEvent(
+                    type="content_block_start",
+                    index=index,
+                    content_block=anthropic.types.ThinkingBlock(type="thinking", thinking="", signature=""),
+                )
+                if block.thinking:
+                    yield anthropic.types.RawContentBlockDeltaEvent(
+                        type="content_block_delta",
+                        index=index,
+                        delta=anthropic.types.ThinkingDelta(type="thinking_delta", thinking=block.thinking),
+                    )
+                yield anthropic.types.RawContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=index,
+                    delta=anthropic.types.SignatureDelta(type="signature_delta", signature=block.signature),
                 )
             elif block.type in ("tool_use", "server_tool_use"):
                 yield anthropic.types.RawContentBlockStartEvent(
@@ -487,34 +584,61 @@ class FalseAnthropicMessages:
         *,
         model: str,
         continuation: _PrefillContinuation | None = None,
+        thinking_display: ThinkingDisplay | None = None,
     ) -> Iterator[anthropic.types.RawMessageStreamEvent]:
         """Translates Gemini stream chunks into the Anthropic raw event sequence:
         message_start, (content_block_start, content_block_delta*, content_block_stop)*, message_delta, message_stop
         """
         last_chunk = None
         index = -1  # index of the current content block
-        open_block_type = None  # type of the block that has not been stopped yet, if any
+        open_block = None  # the block that has not been stopped yet, if any
         has_tool_use = False
 
+        def stop_block() -> Iterator[anthropic.types.RawMessageStreamEvent]:
+            nonlocal open_block
+            if open_block is None:
+                return
+            if open_block.type == "thinking":
+                # like Claude, the signature comes last
+                yield anthropic.types.RawContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=index,
+                    delta=anthropic.types.SignatureDelta(type="signature_delta", signature=open_block.signature),
+                )
+            yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
+            open_block = None
+
+        def start_block(block: anthropic.types.ContentBlock) -> Iterator[anthropic.types.RawMessageStreamEvent]:
+            nonlocal index, open_block
+            yield from stop_block()
+            index += 1
+            open_block = block
+            if block.type == "thinking":
+                block = block.model_copy(update={"thinking": "", "signature": ""})
+            elif block.type == "tool_use":
+                block = block.model_copy(update={"input": {}})
+            yield anthropic.types.RawContentBlockStartEvent(type="content_block_start", index=index, content_block=block)
+
         def text_events(text: str) -> Iterator[anthropic.types.RawMessageStreamEvent]:
-            nonlocal index, open_block_type
             if not text:
                 return
-            if open_block_type != "text":
-                if open_block_type is not None:
-                    yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
-                index += 1
-                open_block_type = "text"
-                yield anthropic.types.RawContentBlockStartEvent(
-                    type="content_block_start",
-                    index=index,
-                    content_block=anthropic.types.TextBlock(type="text", text=""),
-                )
+            if open_block is None or open_block.type != "text":
+                yield from start_block(anthropic.types.TextBlock(type="text", text=""))
             yield anthropic.types.RawContentBlockDeltaEvent(
                 type="content_block_delta",
                 index=index,
                 delta=anthropic.types.TextDelta(type="text_delta", text=text),
             )
+
+        def thinking_events(part: types.Part) -> Iterator[anthropic.types.RawMessageStreamEvent]:
+            if open_block is None or open_block.type not in ("thinking", "redacted_thinking"):
+                yield from start_block(self._thinking_block(part, thinking_display))
+            if open_block.type == "thinking" and thinking_display != "omitted":
+                yield anthropic.types.RawContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=index,
+                    delta=anthropic.types.ThinkingDelta(type="thinking_delta", thinking=part.text),
+                )
 
         for chunk in chunks:
             if last_chunk is None:
@@ -535,22 +659,19 @@ class FalseAnthropicMessages:
             for part in parts:
                 if part.function_call:
                     # Gemini sends each function call whole, so it becomes a full block on its own
-                    if open_block_type is not None:
-                        yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
-                    index += 1
                     has_tool_use = True
                     block = self._tool_use_from_function_call(part)
-                    yield anthropic.types.RawContentBlockStartEvent(
-                        type="content_block_start", index=index, content_block=block.model_copy(update={"input": {}})
-                    )
+                    yield from start_block(block)
                     yield anthropic.types.RawContentBlockDeltaEvent(
                         type="content_block_delta",
                         index=index,
                         delta=anthropic.types.InputJSONDelta(type="input_json_delta", partial_json=json.dumps(block.input)),
                     )
-                    yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
-                    open_block_type = None
-                elif part.text and not part.thought:
+                    yield from stop_block()
+                elif part.text and part.thought:
+                    if thinking_display is not None:
+                        yield from thinking_events(part)
+                elif part.text:
                     yield from text_events(continuation.feed(part.text) if continuation else part.text)
 
             if continuation is not None and continuation.stop_sequence is not None:
@@ -561,8 +682,7 @@ class FalseAnthropicMessages:
             raise RuntimeError("Gemini returned an empty stream")
         if continuation is not None:
             yield from text_events(continuation.flush())
-        if open_block_type is not None:
-            yield anthropic.types.RawContentBlockStopEvent(type="content_block_stop", index=index)
+        yield from stop_block()
 
         # the last chunk carries the finish reason and the cumulative token usage
         candidate = last_chunk.candidates[0] if last_chunk.candidates else None
@@ -624,6 +744,7 @@ class FalseAnthropicMessages:
         tools: list[AnthropicTool] | None,
         tool_choice: AnthropicToolChoice | None,
         output_config: AnthropicOutputConfig | None,
+        thinking: AnthropicThinkingConfig | None = None,
     ) -> types.GenerateContentConfig:
         builtin_tools = [web_search.google_search_tool(tool) for tool in tools or [] if web_search.is_web_search_tool(tool)]
         tools = [tool for tool in tools or [] if not web_search.is_web_search_tool(tool)]
@@ -643,9 +764,21 @@ class FalseAnthropicMessages:
             stop_sequences=stop_sequences,
             tools=[*(self._genai_tools(tools) or []), *builtin_tools] or None,
             tool_config=self._genai_tool_config(tool_choice),
+            thinking_config=self._genai_thinking_config(thinking),
             # the exercises run the tools themselves, like with the Anthropic SDK
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
+
+    def _genai_thinking_config(self, thinking: AnthropicThinkingConfig | None) -> types.ThinkingConfig | None:
+        if thinking is None or thinking["type"] == "disabled":
+            # Gemini's default; some models can't turn thinking off, and their thoughts are left out of the response
+            return None
+        if thinking["type"] == "adaptive":
+            # -1 is Gemini's dynamic thinking: the model decides how much to think
+            return types.ThinkingConfig(include_thoughts=True, thinking_budget=-1)
+        if thinking["type"] == "enabled":
+            return types.ThinkingConfig(include_thoughts=True, thinking_budget=thinking["budget_tokens"])
+        raise NotImplementedError(f"Thinking type {thinking['type']!r} is not supported yet")
 
     def _resolve_client_tools(self, tools: list[AnthropicTool] | None) -> tuple[list[AnthropicTool] | None, list[str]]:
         """Replaces the Anthropic-defined client tools (text editor, bash, memory) with regular tools carrying
